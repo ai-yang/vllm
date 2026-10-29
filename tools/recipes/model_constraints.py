@@ -96,16 +96,16 @@ def extract_head_constraints(
     return tuple(constraints)
 
 
-def load_head_constraints(config: dict[str, Any]) -> tuple[HeadConstraint, ...]:
-    """Load the effective serving configuration through vLLM's config loader."""
+def load_effective_hf_config(config: dict[str, Any]) -> Any:
+    """Load the effective serving configuration for all metadata prechecks."""
     from vllm.transformers_utils.config import get_config
 
     hf_overrides = config.get("hf-overrides")
     if isinstance(hf_overrides, str):
         hf_overrides = json.loads(hf_overrides)
     if hf_overrides is not None and not isinstance(hf_overrides, dict):
-        raise ValueError("Head detection requires hf-overrides to be a JSON object")
-    hf_config = get_config(
+        raise ValueError("Model detection requires hf-overrides to be a JSON object")
+    return get_config(
         config["model"],
         trust_remote_code=config.get("trust-remote-code", False),
         revision=config.get("revision"),
@@ -113,8 +113,13 @@ def load_head_constraints(config: dict[str, Any]) -> tuple[HeadConstraint, ...]:
         config_format=config.get("config-format", "auto"),
         hf_overrides_kw=hf_overrides,
     )
+
+
+def load_head_constraints(config: dict[str, Any]) -> tuple[HeadConstraint, ...]:
+    """Read head constraints from the effective serving configuration."""
     return extract_head_constraints(
-        hf_config, include_vision=config.get("mm-encoder-tp-mode") != "data"
+        load_effective_hf_config(config),
+        include_vision=config.get("mm-encoder-tp-mode") != "data",
     )
 
 

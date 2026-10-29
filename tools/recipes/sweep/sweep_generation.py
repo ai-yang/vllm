@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from hardware_detection import HardwareInfo
+from model_constraints import (
+    HeadConstraint,
+    extract_head_constraints,
+    load_effective_hf_config,
+)
 
 from .runtime_tuning import WorkloadHints
 
@@ -250,24 +256,6 @@ def model_parallel_metadata_from_config(hf_config: Any) -> ModelParallelMetadata
     )
 
 
-def inspect_model_parallel_metadata(config: dict[str, Any]) -> ModelParallelMetadata:
-    """Load the model config and extract portable MoE topology markers."""
-    model = config.get("model")
-    if not isinstance(model, str) or not model:
-        raise ValueError("Parallel-layout sweep requires a model in config.yml.")
-
-    from vllm.transformers_utils.config import get_config
-
-    hf_config = get_config(
-        model,
-        trust_remote_code=config.get("trust-remote-code") is True,
-        revision=config.get("revision"),
-        code_revision=config.get("code-revision"),
-        config_format=config.get("config-format", "auto"),
-    )
-    return model_parallel_metadata_from_config(hf_config)
-
-
 def cpu_supports_moe_dp_collectives() -> bool:
     """Whether CPU overrides the variable-size collectives used by MoE DP."""
     try:
@@ -287,12 +275,14 @@ def cpu_supports_moe_dp_collectives() -> bool:
 
 
 def _parallel_layout_name(
-    tensor_parallel_size: int, data_parallel_size: int, numa_node_count: int
+    tensor_parallel_size: int, data_parallel_size: int, hardware: HardwareInfo
 ) -> str:
     name = f"tp{tensor_parallel_size}_dp{data_parallel_size}"
     used_nodes = tensor_parallel_size * data_parallel_size
-    if used_nodes != numa_node_count:
-        name += f"_numa{used_nodes}of{numa_node_count}"
+    if hardware.device_type == "cuda":
+        return f"{name}_gpu{used_nodes}of{hardware.gpu_count}"
+    if used_nodes != hardware.numa_node_count:
+        name += f"_numa{used_nodes}of{hardware.numa_node_count}"
     return name
 
 
@@ -313,30 +303,79 @@ def _default_parallel_layout_sizes(numa_node_count: int) -> list[tuple[int, int]
     return layouts
 
 
+def _validate_gpu_layout_scope(config: dict[str, Any]) -> None:
+    for key in (
+        "pipeline-parallel-size",
+        "prefill-context-parallel-size",
+        "decode-context-parallel-size",
+        "nnodes",
+    ):
+        value = config.get(key, 1)
+        if type(value) is not int or value != 1:
+            raise ValueError(f"GPU layout sweep requires {key}=1; got {value!r}.")
+    for key in (
+        "data-parallel-rank",
+        "data-parallel-start-rank",
+        "data-parallel-size-local",
+    ):
+        if config.get(key) is not None:
+            raise ValueError(f"GPU layout sweep does not support explicit {key}.")
+    if config.get("node-rank", 0) != 0:
+        raise ValueError("GPU layout sweep requires node-rank=0.")
+    for key in (
+        "data-parallel-external-lb",
+        "data-parallel-hybrid-lb",
+        "data-parallel-multi-port-external-lb",
+        "headless",
+    ):
+        if config.get(key):
+            raise ValueError(f"GPU layout sweep does not support {key}.")
+    for key, allowed in (
+        ("distributed-executor-backend", (None, "mp", "uni")),
+        ("data-parallel-backend", (None, "mp")),
+    ):
+        if config.get(key) not in allowed:
+            raise ValueError(
+                f"GPU layout sweep requires local internal DP; unsupported "
+                f"{key}={config[key]!r}."
+            )
+
+
 def build_parallel_layout_plan(
     config: dict[str, Any],
     workload: WorkloadHints,
-    numa_node_count: int,
+    hardware: HardwareInfo,
     *,
     model_metadata: ModelParallelMetadata = UNKNOWN_MODEL_PARALLEL_METADATA,
+    head_constraints: tuple[HeadConstraint, ...] | None = None,
     cpu_moe_dp_supported: bool = True,
     tune_scheduler: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build candidates and diagnostics after applying parallel safety policy."""
     validate_sweep_workload(workload)
-    if numa_node_count <= 1:
-        raise ValueError("Parallel-layout sweep requires at least two NUMA nodes.")
-
-    layouts = _default_parallel_layout_sizes(numa_node_count)
+    is_gpu = hardware.device_type == "cuda"
+    if is_gpu:
+        _validate_gpu_layout_scope(config)
+        if hardware.gpu_count < 1:
+            raise ValueError("GPU layout sweep requires at least one visible GPU.")
+        layouts = [
+            (tp, dp)
+            for tp in sorted(SUPPORTED_TENSOR_PARALLEL_SIZES)
+            for dp in range(1, hardware.gpu_count // tp + 1)
+        ]
+    else:
+        if hardware.numa_node_count <= 1:
+            raise ValueError("Parallel-layout sweep requires at least two NUMA nodes.")
+        layouts = _default_parallel_layout_sizes(hardware.numa_node_count)
     skipped: list[dict[str, Any]] = []
-    if model_metadata.is_moe and not cpu_moe_dp_supported:
+    if not is_gpu and model_metadata.is_moe and not cpu_moe_dp_supported:
         for tensor_parallel_size, data_parallel_size in layouts:
             if data_parallel_size <= 1:
                 continue
             skipped.append(
                 {
                     "_benchmark_name": _parallel_layout_name(
-                        tensor_parallel_size, data_parallel_size, numa_node_count
+                        tensor_parallel_size, data_parallel_size, hardware
                     ),
                     "policy": "cpu_moe_dp_collectives",
                     "tensor_parallel_size": tensor_parallel_size,
@@ -354,7 +393,7 @@ def build_parallel_layout_plan(
             for tensor_parallel_size in sorted(
                 SUPPORTED_TENSOR_PARALLEL_SIZES, reverse=True
             )
-            if tensor_parallel_size <= numa_node_count
+            if tensor_parallel_size <= hardware.numa_node_count
         ]
 
     pcp_size = config.get("prefill-context-parallel-size", 1)
@@ -364,10 +403,39 @@ def build_parallel_layout_plan(
 
     candidates = []
     for tensor_parallel_size, data_parallel_size in layouts:
-        name = _parallel_layout_name(
-            tensor_parallel_size, data_parallel_size, numa_node_count
-        )
+        name = _parallel_layout_name(tensor_parallel_size, data_parallel_size, hardware)
         effective_parallel_size = tensor_parallel_size * data_parallel_size * pcp_size
+        failed_heads = [
+            constraint.name
+            for constraint in head_constraints or ()
+            if is_gpu and not constraint.supports(tensor_parallel_size)
+        ]
+        reason = None
+        policy = None
+        if failed_heads:
+            policy = "attention_head_partition"
+            reason = (
+                "TP does not support attention/KV head partition or replication: "
+                + ", ".join(failed_heads)
+            )
+        elif (
+            is_gpu
+            and config.get("enable-eplb")
+            and (not uses_expert_parallel or effective_parallel_size <= 1)
+        ):
+            policy = "eplb_parallel_size"
+            reason = "EPLB requires expert parallelism and TP x DP x PCP > 1"
+        if reason is not None:
+            skipped.append(
+                {
+                    "_benchmark_name": name,
+                    "policy": policy,
+                    "tensor_parallel_size": tensor_parallel_size,
+                    "data_parallel_size": data_parallel_size,
+                    "reason": reason,
+                }
+            )
+            continue
         moe_width = model_metadata.moe_intermediate_size
         if (
             model_metadata.is_moe
@@ -405,7 +473,7 @@ def build_parallel_layout_plan(
             candidate["max_num_batched_tokens"] = max_num_batched_tokens
         candidates.append(candidate)
 
-    if not candidates:
+    if not candidates and not is_gpu:
         raise ValueError(
             "No valid parallel-layout candidates remain after applying model and "
             "runtime capability checks. See parallel_layout_skips.json."
@@ -416,18 +484,20 @@ def build_parallel_layout_plan(
 def build_parallel_layout_params(
     config: dict[str, Any],
     workload: WorkloadHints,
-    numa_node_count: int,
+    hardware: HardwareInfo,
     *,
     model_metadata: ModelParallelMetadata = UNKNOWN_MODEL_PARALLEL_METADATA,
+    head_constraints: tuple[HeadConstraint, ...] | None = None,
     cpu_moe_dp_supported: bool = True,
     tune_scheduler: bool = False,
 ) -> list[dict[str, Any]]:
-    """Build full-NUMA layouts plus the largest supported TP layout."""
+    """Build resource-bounded layouts with known model constraints applied."""
     candidates, _ = build_parallel_layout_plan(
         config,
         workload,
-        numa_node_count,
+        hardware,
         model_metadata=model_metadata,
+        head_constraints=head_constraints,
         cpu_moe_dp_supported=cpu_moe_dp_supported,
         tune_scheduler=tune_scheduler,
     )
@@ -496,6 +566,34 @@ def _write_sweep_config(path: Path, config: dict[str, Any]) -> None:
         "vLLM defaults.\n"
     )
     path.write_text(header + body, encoding="utf-8")
+
+
+def _runtime_address_setup() -> str:
+    """Resolve addresses from the stage's actual YAML, not the initial recipe."""
+    return """ADDRESS_COMMANDS="$(python3 - "${CONFIG_PATH}" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+import yaml
+
+config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if not isinstance(config, dict):
+    raise SystemExit("Sweep configuration must be a YAML object.")
+host = config.get("host") or "127.0.0.1"
+port = config.get("port", 8000)
+if not isinstance(host, str):
+    raise SystemExit("Sweep host must be a string.")
+if type(port) is not int or not 1 <= port <= 65535:
+    raise SystemExit("Sweep port must be an integer in 1..65535.")
+client_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+url_host = f"[{client_host}]" if ":" in client_host else client_host
+print(shlex.join(["--host", host, "--port", str(port)]))
+print(shlex.join(["--base-url", f"http://{url_host}:{port}"]))
+PY
+)"
+mapfile -t ADDRESS_ARGS <<< "${ADDRESS_COMMANDS}"
+"""
 
 
 def _write_run_script(
@@ -592,9 +690,10 @@ fi
 SWEEP_RETRY_COUNT="${{VLLM_RECIPE_SWEEP_RETRY_COUNT:-0}}"
 MAX_SWEEP_RETRIES="${{VLLM_RECIPE_SWEEP_RETRIES:-2}}"
 
-{prepare_config}vllm bench sweep serve \
-  --serve-cmd "vllm serve --config '${{CONFIG_PATH}}'" \
-  --bench-cmd "{bench_cmd}" \
+{prepare_config}{_runtime_address_setup()}
+vllm bench sweep serve \
+  --serve-cmd "vllm serve --config '${{CONFIG_PATH}}' ${{ADDRESS_ARGS[0]}}" \
+  --bench-cmd "{bench_cmd} ${{ADDRESS_ARGS[1]}}" \
   --serve-params "${{SCRIPT_DIR}}/{serve_params_name}" \
   --bench-params "${{SCRIPT_DIR}}/bench_params.json" \
   --output-dir "${{SCRIPT_DIR}}/results" \
@@ -896,11 +995,13 @@ def write_parallel_layout_sweep_files(
     env_path: str,
     config: dict[str, Any],
     workload: WorkloadHints,
-    numa_node_count: int,
+    hardware: HardwareInfo,
     tune_scheduler: bool = False,
 ) -> list[Path]:
-    """Write a standalone NUMA-aware TP/DP sweep package."""
+    """Write a standalone hardware-aware TP/DP sweep package."""
     validate_sweep_workload(workload)
+    if hardware.device_type == "cuda":
+        _validate_gpu_layout_scope(config)
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -911,6 +1012,8 @@ def write_parallel_layout_sweep_files(
     run_parallel = directory / "run_parallel_layout_sweep.sh"
     recommend_parallel = directory / "recommend_parallel_layout.py"
     guide = directory / "SWEEP.md"
+    hardware_path = directory / "hardware_info.json"
+    _write_json(hardware_path, hardware.to_dict())
 
     initial_config_rel = _relative_to(directory, config_path)
     parallel_config_rel = _relative_to(directory, str(parallel_config))
@@ -921,28 +1024,52 @@ def write_parallel_layout_sweep_files(
     _write_sweep_config(parallel_config, config)
     benchmark_config_rel = initial_config_rel if tune_scheduler else parallel_config_rel
 
+    head_constraints = None
+    model_metadata = UNKNOWN_MODEL_PARALLEL_METADATA
+    precheck: dict[str, Any] = {"heads": "not_prechecked", "moe": "not_prechecked"}
     try:
-        model_metadata = inspect_model_parallel_metadata(config)
+        hf_config = load_effective_hf_config(config)
     except Exception as exc:
+        precheck["load_error"] = str(exc)
         print(
-            "Warning: could not inspect model parallel metadata; retaining the "
-            f"generic layouts and relying on sweep error isolation: {exc}",
+            f"Warning: model metadata not prechecked; relying on sweep "
+            f"error isolation: {exc}",
             file=sys.stderr,
         )
-        model_metadata = UNKNOWN_MODEL_PARALLEL_METADATA
+    else:
+        model_metadata = model_parallel_metadata_from_config(hf_config)
+        precheck["moe"] = "checked"
+        try:
+            head_constraints = extract_head_constraints(
+                hf_config, include_vision=config.get("mm-encoder-tp-mode") != "data"
+            )
+            precheck["heads"] = "checked"
+        except Exception as exc:
+            precheck["head_error"] = str(exc)
+            print(f"Warning: heads not prechecked: {exc}", file=sys.stderr)
+    precheck_path = directory / "parallel_layout_precheck.json"
+    _write_json(precheck_path, precheck)
     cpu_moe_dp_supported = (
-        cpu_supports_moe_dp_collectives() if model_metadata.is_moe else True
+        cpu_supports_moe_dp_collectives()
+        if hardware.device_type == "cpu" and model_metadata.is_moe
+        else True
     )
     parallel_candidates, skipped_candidates = build_parallel_layout_plan(
         config,
         workload,
-        numa_node_count,
+        hardware,
         model_metadata=model_metadata,
+        head_constraints=head_constraints,
         cpu_moe_dp_supported=cpu_moe_dp_supported,
         tune_scheduler=tune_scheduler,
     )
     _write_json(parallel_params, parallel_candidates)
     _write_json(parallel_skips, skipped_candidates)
+    if not parallel_candidates:
+        raise ValueError(
+            "No parallel-layout candidates remain after model prechecks. "
+            "See parallel_layout_skips.json."
+        )
     _write_json(bench_params, build_bench_params(workload))
     _write_run_script(
         run_parallel,
@@ -967,28 +1094,7 @@ def write_parallel_layout_sweep_files(
     guide.write_text(
         f"""# Parallel-Layout Sweep
 
-This package tunes only the NUMA-aware TP/DP layout.
-
-Primary candidates use every effective NUMA node:
-
-```text
-tensor_parallel_size * data_parallel_size = {numa_node_count}
-```
-
-Tensor parallelism is restricted to `1`, `2`, `4`, or `8`. The largest
-supported TP not exceeding the NUMA-node count is also included, even when it
-leaves some NUMA nodes idle.
-
-Before benchmarking, the generator applies two MoE safety checks:
-
-- When the CPU communicator lacks variable-size MoE collectives, MoE candidates
-  use `DP=1`; every supported TP size is retained as a replacement candidate.
-- With expert parallelism disabled and a known MoE intermediate size, candidates
-  must satisfy `moe_intermediate_size % (TP * DP * PCP) == 0`.
-
-Rejected layouts and their reasons are written to
-`parallel_layout_skips.json`. If model metadata cannot be inspected, generic
-layouts are retained and the runner's per-combination error isolation applies.
+{_parallel_layout_guide(hardware)}
 
 Run:
 
@@ -1015,6 +1121,8 @@ concurrency and scheduler tuning should follow automatically.
     return [
         parallel_params,
         parallel_skips,
+        precheck_path,
+        hardware_path,
         bench_params,
         run_parallel,
         recommend_parallel,
@@ -1098,6 +1206,8 @@ ENV_PATH="${{SCRIPT_DIR}}/{env_rel}"
 
 source "${{ENV_PATH}}"
 
+{_runtime_address_setup()}
+
 # Released/nightly vLLM images keep recipe-relative assets such as
 # examples/*.jinja under /vllm-workspace. Launch sweep server subprocesses
 # from there when available so relative recipe assets resolve like they do
@@ -1124,8 +1234,8 @@ SERVER_READY_TIMEOUT="${{VLLM_RECIPE_SERVER_READY_TIMEOUT:-1800}}"
 run_concurrency_sweep() {{
   if [[ "{int(use_adaptive_sla_search)}" == "1" ]]; then
     python3 "${{SCRIPT_DIR}}/adaptive_concurrency.py" \
-      --serve-cmd "vllm serve --config '${{CONFIG_PATH}}'" \
-      --bench-cmd "{bench_cmd}" \
+      --serve-cmd "vllm serve --config '${{CONFIG_PATH}}' ${{ADDRESS_ARGS[0]}}" \
+      --bench-cmd "{bench_cmd} ${{ADDRESS_ARGS[1]}}" \
       --results-dir "${{SCRIPT_DIR}}/results/concurrency-tuning" \
       {adaptive_args_text} \
       --server-ready-timeout "${{SERVER_READY_TIMEOUT}}" \
@@ -1133,8 +1243,8 @@ run_concurrency_sweep() {{
       "$@"
   else
     vllm bench sweep serve_workload \
-      --serve-cmd "vllm serve --config '${{CONFIG_PATH}}'" \
-      --bench-cmd "{bench_cmd}" \
+      --serve-cmd "vllm serve --config '${{CONFIG_PATH}}' ${{ADDRESS_ARGS[0]}}" \
+      --bench-cmd "{bench_cmd} ${{ADDRESS_ARGS[1]}}" \
       --bench-params "${{SCRIPT_DIR}}/concurrency_bench_params.json" \
       --output-dir "${{SCRIPT_DIR}}/results" \
       --experiment-name concurrency-tuning \
@@ -1146,7 +1256,7 @@ run_concurrency_sweep() {{
   fi
 }}
 
-run_concurrency_sweep || {{
+run_concurrency_sweep "$@" || {{
     if [[ "${{SWEEP_RETRY_COUNT}}" -ge "${{MAX_SWEEP_RETRIES}}" ]]; then
       echo "Sweep failed after ${{MAX_SWEEP_RETRIES}} automatic retries." >&2
       exit 1
@@ -1340,7 +1450,58 @@ fi
     path.chmod(path.stat().st_mode | 0o111)
 
 
-def _write_full_guide(path: Path, workload: WorkloadHints) -> None:
+def _parallel_layout_guide(hardware: HardwareInfo) -> str:
+    if hardware.device_type == "cuda":
+        scope = f"""## GPU layout scope
+
+Detected visible GPU budget: **{hardware.gpu_count}**. Candidates include TP1DP1
+and partial/full-resource layouts with `TP * DP <= {hardware.gpu_count}`.
+TP uses `1`, `2`, `4`, or `8`; DP uses every positive integer within the budget.
+Names use `_gpu<used>of<visible>`, not NUMA counts.
+
+Only single-node, local internal DP with `PP=PCP=DCP=1` is supported.
+Explicit DP rank (including zero), DP-local size/start-rank, Ray/external
+launchers, external/hybrid/multi-port load balancing and headless deployment
+are rejected, not silently rewritten. No context-parallel dimension is scanned.
+
+Known attention/KV heads filter TP partition/replication candidates. GPU MoE
+does not depend on CPU collective support. EPLB requires EP and more than one
+participating GPU; incompatible candidates, including TP1DP1, are skipped.
+Link topology (including CNS or unknown P2P status) does not exclude TP or
+predict a winner. Only measured SLA/throughput determines the recommendation."""
+    else:
+        scope = f"""## CPU NUMA layout scope
+
+Primary candidates use all **{hardware.numa_node_count}** effective NUMA nodes.
+TP uses `1`, `2`, `4`, or `8`. The largest supported TP not exceeding the
+NUMA-node count is also included even when some nodes remain idle.
+At least two NUMA nodes are required. CPU candidate names are unchanged.
+
+When the CPU communicator lacks variable-size MoE collectives, MoE candidates
+use `DP=1`; every supported TP size is retained as a replacement candidate."""
+    return (
+        scope
+        + """
+
+With expert parallelism disabled and a known MoE intermediate size, candidates
+must satisfy `moe_intermediate_size % (TP * DP * PCP) == 0`.
+Rejected layouts and reasons are saved in `parallel_layout_skips.json`.
+`parallel_layout_precheck.json` distinguishes checked metadata from
+`not_prechecked`: uninspected layouts are not confirmed feasible.
+All checks use the effective HF configuration, including revision, code revision,
+trust-remote-code and hf-overrides. Startup/benchmark failures remain isolated
+by the existing runner; passing metadata checks does not guarantee model fit.
+
+Each stage reads its actual YAML host/port at execution time and supplies
+explicit matching serve and benchmark addresses. Wildcard binds use loopback
+for clients. Stop existing services on that port before starting the sweep.
+"""
+    )
+
+
+def _write_full_guide(
+    path: Path, workload: WorkloadHints, hardware: HardwareInfo
+) -> None:
     content = f"""# End-to-End Runtime Tuning
 
 This package keeps one fixed workload shape and tunes in dependency order:
@@ -1348,6 +1509,8 @@ This package keeps one fixed workload shape and tunes in dependency order:
 ```text
 TP/DP -> max_concurrency -> scheduler
 ```
+
+{_parallel_layout_guide(hardware)}
 
 The supplied `--concurrency={workload.concurrency}` is the representative load
 used for TP/DP selection and to size the Workload Explorer dataset. Stage 2
@@ -1451,7 +1614,7 @@ def write_full_sweep_files(
     env_path: str,
     config: dict[str, Any],
     workload: WorkloadHints,
-    numa_node_count: int,
+    hardware: HardwareInfo,
     tune_scheduler: bool = False,
 ) -> list[Path]:
     """Write TP/DP -> concurrency -> scheduler end-to-end tuning artifacts."""
@@ -1461,7 +1624,7 @@ def write_full_sweep_files(
         env_path=env_path,
         config=config,
         workload=workload,
-        numa_node_count=numa_node_count,
+        hardware=hardware,
         tune_scheduler=tune_scheduler,
     )
 
@@ -1514,7 +1677,7 @@ def write_full_sweep_files(
     initial_config = directory / "initial-config.yml"
     initial_config.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     _write_full_run_script(run_full, workload=workload)
-    _write_full_guide(guide, workload)
+    _write_full_guide(guide, workload, hardware)
 
     return [
         *files,

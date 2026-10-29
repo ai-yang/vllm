@@ -12,8 +12,13 @@ steps:
   - "!vllm/distributed/kv_transfer/"
   - rust/src/bench/tests/python_serve_flags.txt
   - tests/benchmarks/
+  - tools/recipes/
+  - tests/tools/test_recipe_gpu_sweep.py
   commands:
-  - pytest -v -s benchmarks/
+  - >-
+    pytest -v -s
+    benchmarks/
+    tools/test_recipe_gpu_sweep.py
   mirror:
     amd:
       label: ":amd: (MI355 DPX) Benchmarks CLI"

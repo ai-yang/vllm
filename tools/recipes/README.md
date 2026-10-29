@@ -114,7 +114,7 @@ custom output files, and deployment scope.
 ### 2. Hardware Information (Optional)
 
 Add `--detect-hardware` when using the converter directly and the target host's
-effective CPU/NUMA/memory resources should refine deployment-sensitive values:
+effective CPU/NUMA resources or visible CUDA GPUs should refine deployment-sensitive values:
 
 ```bash
 python3 tools/recipes/recipe_json_to_vllm_config.py \
@@ -125,6 +125,9 @@ python3 tools/recipes/recipe_json_to_vllm_config.py \
 
 `serve_with_recipe.sh` enables this automatically for `xeon6`. See
 [RUNTIME_TUNING.md](RUNTIME_TUNING.md#hardware-information) for details.
+For `rtx_3090`/`rtx_3090_4x`, request detection explicitly. These policies use
+per-device VRAM, preserve the recipe TP/DP layout, and leave layout selection
+to the existing benchmark sweep; see the [CUDA resource rules](RUNTIME_TUNING.md#cuda-hardware).
 
 ### 3. Workload Information (Optional)
 

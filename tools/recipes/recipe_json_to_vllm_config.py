@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import shlex
 import sys
 import urllib.parse
@@ -148,15 +149,15 @@ def parse_args() -> argparse.Namespace:
         (
             "Refine the recipe baseline only when additional information is supplied. "
             "Runtime tuning is enabled only for recipe hardware with a registered "
-            "policy (currently: xeon6)."
+            "policy (currently: xeon6, rtx_3090, rtx_3090_4x)."
         ),
     )
     tuning.add_argument(
         "--detect-hardware",
         action="store_true",
         help=(
-            "Detect effective CPU/NUMA/memory resources and allow the selected "
-            "recipe-hardware policy to override recipe runtime arguments."
+            "Detect effective CPU/NUMA resources or visible CUDA GPUs, as selected "
+            "by the recipe hardware, and conservatively refine runtime arguments."
         ),
     )
     tuning.add_argument(
@@ -222,7 +223,8 @@ def parse_args() -> argparse.Namespace:
         "--generate-parallel-layout-sweep",
         action="store_true",
         help=(
-            "Generate a standalone NUMA-aware TP/DP sweep. Requires --detect-hardware."
+            "Generate a visible-GPU or NUMA-aware TP/DP sweep. "
+            "Requires --detect-hardware."
         ),
     )
     sweep.add_argument(
@@ -931,6 +933,7 @@ def main() -> int:
             # Keep plain Recipes conversion lightweight. vLLM-specific modules
             # are imported only for optional runtime tuning or sweep generation.
             from sweep.runtime_tuning import (
+                CUDA_HARDWARE_PROFILES,
                 WorkloadHints,
                 finetune_runtime_config,
                 get_runtime_tuning_policies,
@@ -972,7 +975,34 @@ def main() -> int:
                     detect_hardware,
                 )
 
-                hardware = detect_hardware()
+                if recipe_hardware in CUDA_HARDWARE_PROFILES:
+                    recipe_env = recipe.get("env") or {}
+                    if not isinstance(recipe_env, dict):
+                        raise ValueError("Recipe env must be an object.")
+                    # Inspect the same visibility that env.sh will establish.
+                    # Restore the converter process's environment after probing.
+                    saved_env = {
+                        key: os.environ.get(key)
+                        for key in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")
+                        if key in recipe_env
+                    }
+                    try:
+                        for key in saved_env:
+                            os.environ[key] = str(recipe_env[key])
+                        hardware = detect_hardware(device_type="cuda")
+                    finally:
+                        for key, value in saved_env.items():
+                            if value is None:
+                                os.environ.pop(key, None)
+                            else:
+                                os.environ[key] = value
+                    # Freeze identity and order, not just a count: later runs
+                    # must not silently select a different set of GPUs.
+                    env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(
+                        gpu.uuid for gpu in hardware.gpu_devices
+                    )
+                else:
+                    hardware = detect_hardware()
 
                 if (
                     args.tp_dp_numa_bind_workaround
@@ -1032,7 +1062,7 @@ def main() -> int:
                 env_path=args.env_out,
                 config=config,
                 workload=workload,
-                numa_node_count=hardware.numa_node_count,
+                hardware=hardware,
                 tune_scheduler=args.tune_scheduler,
             )
         elif args.generate_parallel_layout_sweep:
@@ -1049,7 +1079,7 @@ def main() -> int:
                 env_path=args.env_out,
                 config=config,
                 workload=workload,
-                numa_node_count=hardware.numa_node_count,
+                hardware=hardware,
                 tune_scheduler=args.tune_scheduler,
             )
         elif args.generate_concurrency_sweep:

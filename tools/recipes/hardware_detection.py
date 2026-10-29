@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""CPU hardware discovery for optional vLLM Recipes runtime tuning.
+"""CPU and CUDA hardware discovery for optional vLLM Recipes runtime tuning.
 
 Keep this module focused on facts exposed to the current process/container.
 Tuning decisions belong in sweep/runtime_tuning.py.
@@ -9,10 +9,12 @@ Tuning decisions belong in sweep/runtime_tuning.py.
 
 from __future__ import annotations
 
+import argparse
 import json
 import platform
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 
 from vllm.utils.cpu_resource_utils import (
     get_allowed_cpu_list,
@@ -31,16 +33,45 @@ class NumaNodeInfo:
 
 
 @dataclass(frozen=True)
+class GpuDeviceInfo:
+    visible_index: int
+    physical_index: int
+    uuid: str
+    name: str
+    compute_capability: tuple[int, int]
+    total_memory_bytes: int
+    free_memory_bytes: int
+    pci_bus_id: str
+    numa_node_id: int | None
+
+
+@dataclass(frozen=True)
+class GpuLinkInfo:
+    source_index: int
+    target_index: int
+    p2p_read_status: int | None
+    nvlink_connected: bool | None
+    topology_ancestor: int | None
+
+
+@dataclass(frozen=True)
 class HardwareInfo:
     architecture: str
     socket_count: int | None
     numa_nodes: tuple[NumaNodeInfo, ...]
     allowed_logical_cpu_count: int
     physical_core_count: int
+    device_type: Literal["cpu", "cuda"] = "cpu"
+    gpu_devices: tuple[GpuDeviceInfo, ...] = ()
+    gpu_links: tuple[GpuLinkInfo, ...] = ()
 
     @property
     def numa_node_count(self) -> int:
         return len(self.numa_nodes)
+
+    @property
+    def gpu_count(self) -> int:
+        return len(self.gpu_devices)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -137,14 +168,105 @@ def _read_socket_id(cpu_id: int) -> int | None:
         return None
 
 
-def detect_hardware() -> HardwareInfo:
-    """Return CPU resources effectively available to this process.
+def _read_gpu_numa_node(pci_bus_id: str) -> int | None:
+    # NVML uses an eight-digit PCI domain; Linux sysfs uses four digits.
+    path = Path("/sys/bus/pci/devices") / pci_bus_id[-12:].lower() / "numa_node"
+    try:
+        node = int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return node if node >= 0 else None
+
+
+def _detect_cuda_devices() -> tuple[tuple[GpuDeviceInfo, ...], tuple[GpuLinkInfo, ...]]:
+    """Read visible CUDA resources without creating a CUDA context.
+
+    NVML topology is descriptive, not a bandwidth measurement. In particular,
+    a non-OK P2P status does not imply that NCCL cannot use host staging.
+    """
+    from vllm.platforms import current_platform
+    from vllm.utils.import_utils import import_pynvml
+
+    if not current_platform.is_cuda():
+        raise RuntimeError("CUDA hardware detection requires an NVIDIA CUDA platform.")
+
+    nvml = import_pynvml()
+    nvml.nvmlInit()
+    try:
+        count = current_platform.device_count()
+        if count == 0:
+            raise RuntimeError("No GPUs are visible to this process.")
+
+        devices = []
+        handles = []
+        for index in range(count):
+            physical = current_platform.visible_device_id_to_physical_device_id(index)
+            handle = nvml.nvmlDeviceGetHandleByIndex(physical)
+            handles.append(handle)
+            memory = nvml.nvmlDeviceGetMemoryInfo(handle)
+            pci_bus_id = nvml.nvmlDeviceGetPciInfo(handle).busId
+            if isinstance(pci_bus_id, bytes):
+                pci_bus_id = pci_bus_id.decode("ascii")
+            devices.append(
+                GpuDeviceInfo(
+                    visible_index=index,
+                    physical_index=physical,
+                    uuid=nvml.nvmlDeviceGetUUID(handle),
+                    name=nvml.nvmlDeviceGetName(handle),
+                    compute_capability=tuple(
+                        nvml.nvmlDeviceGetCudaComputeCapability(handle)
+                    ),
+                    total_memory_bytes=int(memory.total),
+                    free_memory_bytes=int(memory.free),
+                    pci_bus_id=pci_bus_id,
+                    numa_node_id=_read_gpu_numa_node(pci_bus_id),
+                )
+            )
+
+        links = []
+        for source, handle in enumerate(handles):
+            for target, peer in enumerate(handles):
+                if source == target:
+                    continue
+                try:
+                    p2p_read = int(
+                        nvml.nvmlDeviceGetP2PStatus(
+                            handle, peer, nvml.NVML_P2P_CAPS_INDEX_READ
+                        )
+                    )
+                except nvml.NVMLError:
+                    p2p_read = None
+                try:
+                    nvlink = (
+                        nvml.nvmlDeviceGetP2PStatus(
+                            handle, peer, nvml.NVML_P2P_CAPS_INDEX_NVLINK
+                        )
+                        == nvml.NVML_P2P_STATUS_OK
+                    )
+                except nvml.NVMLError:
+                    nvlink = None
+                try:
+                    ancestor = int(
+                        nvml.nvmlDeviceGetTopologyCommonAncestor(handle, peer)
+                    )
+                except nvml.NVMLError:
+                    ancestor = None
+                links.append(GpuLinkInfo(source, target, p2p_read, nvlink, ancestor))
+        return tuple(devices), tuple(links)
+    finally:
+        nvml.nvmlShutdown()
+
+
+def detect_hardware(*, device_type: Literal["cpu", "cuda"] = "cpu") -> HardwareInfo:
+    """Return resources effectively available to this process.
 
     vLLM's CPU helpers already honor process CPU affinity and cgroup-aware
     memory limits. We intentionally use get_memory_affinity() rather than
     get_visible_memory_node() so CPU_VISIBLE_MEMORY_NODES does not become an
     input to the detector; auto binding remains owned by the CPU backend.
     """
+    if device_type not in ("cpu", "cuda"):
+        raise ValueError(f"Unsupported hardware device type: {device_type!r}")
     cpus = get_allowed_cpu_list()
     if not cpus:
         raise RuntimeError("vLLM reported no CPUs available to this process.")
@@ -180,17 +302,27 @@ def detect_hardware() -> HardwareInfo:
         socket_id for cpu in cpus if (socket_id := _read_socket_id(cpu.id)) is not None
     }
 
+    gpu_devices, gpu_links = (
+        _detect_cuda_devices() if device_type == "cuda" else ((), ())
+    )
+
     return HardwareInfo(
         architecture=platform.machine(),
         socket_count=len(socket_ids) if socket_ids else None,
         numa_nodes=tuple(numa_nodes),
         allowed_logical_cpu_count=len(cpus),
         physical_core_count=len(physical_cores),
+        device_type=device_type,
+        gpu_devices=gpu_devices,
+        gpu_links=gpu_links,
     )
 
 
 def main() -> int:
-    print(json.dumps(detect_hardware().to_dict(), indent=2))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cpu")
+    args = parser.parse_args()
+    print(json.dumps(detect_hardware(device_type=args.device_type).to_dict(), indent=2))
     return 0
 
 

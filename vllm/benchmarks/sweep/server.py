@@ -10,6 +10,8 @@ from typing import Self
 
 import requests
 
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+
 
 class ServerProcess:
     VLLM_RESET_CACHE_ENDPOINTS = [
@@ -77,21 +79,24 @@ class ServerProcess:
         self.run_subcommand(self.after_bench_cmd)
 
     def _get_vllm_server_address(self) -> str:
-        server_cmd = self.server_cmd
+        parser = FlexibleArgumentParser(add_help=False, allow_abbrev=False)
+        parser.add_argument("--host", default="localhost")
+        parser.add_argument("-p", "--port", type=int, default=8000)
+        parser.add_argument("--config")
+        args, _ = parser.parse_known_args(self.server_cmd)
+        if args.config and self.server_cmd[0].endswith("vllm"):
+            # Match serve's CLI > YAML > defaults precedence, including when
+            # explicit host/port options appear before --config.
+            config_args = parser.load_config_file(args.config)
+            args, _ = parser.parse_known_args(config_args + self.server_cmd)
+        host, port = args.host, args.port
 
-        for host_key in ("--host",):
-            if host_key in server_cmd:
-                host = server_cmd[server_cmd.index(host_key) + 1]
-                break
-        else:
-            host = "localhost"
-
-        for port_key in ("-p", "--port"):
-            if port_key in server_cmd:
-                port = int(server_cmd[server_cmd.index(port_key) + 1])
-                break
-        else:
-            port = 8000  # The default value in vllm serve
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
 
         return f"http://{host}:{port}"
 

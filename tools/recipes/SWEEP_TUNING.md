@@ -182,10 +182,12 @@ cat /output/sweep/recommendation.json
 
 ### Stage 1: Tune TP/DP
 
-The parallel-layout stage measures NUMA-aware combinations of:
+The parallel-layout stage measures hardware-aware combinations of:
 
 - `tensor-parallel-size`
 - `data-parallel-size`
+
+#### CPU NUMA candidates
 
 Primary candidates use all effective NUMA nodes:
 
@@ -210,20 +212,23 @@ NUMA-node count, even if that layout leaves some NUMA nodes idle.
 The generator then applies model- and runtime-aware safety policy before any
 server is started:
 
-1. For an MoE model, if the CPU communicator does not override the variable-size
+1. On CPU, for an MoE model, if the communicator does not override the variable-size
    `all_gatherv` and `reduce_scatterv` collectives used by MoE data parallelism,
    all generated candidates use `DP=1`. Every supported TP value is retained,
    so a 6-NUMA-node host tests `TP=4`, `TP=2`, and `TP=1` rather than only `TP=4`.
 2. When MoE dimensions are known and expert parallelism is disabled, the fused
-   MoE path flattens TP, DP, and PCP. A candidate is valid only when
-   `moe_intermediate_size % (TP * DP * PCP) == 0`.
+   MoE path flattens TP, DP, and PCP. A candidate passes this check only when
+   `moe_intermediate_size % (TP * DP * PCP) == 0`; this does not guarantee model fit.
 3. Failures not covered by a preflight rule remain isolated by
    `--continue-on-error` when the installed CLI supports it, with bounded
    `--resume` retries as the compatibility fallback.
 
 Skipped candidates and reasons are saved in
-`sweep/parallel_layout_skips.json`. If model metadata cannot be loaded, the
-generator keeps the generic layouts and relies on the third policy.
+`sweep/parallel_layout_skips.json`. `parallel_layout_precheck.json` records
+`checked` versus `not_prechecked` metadata. Unknown metadata leaves generic
+layouts **unprechecked**, not confirmed feasible; actual failures use the third
+policy. Head and MoE checks share the effective HF configuration, including
+`revision`, `code-revision`, `trust-remote-code`, and `hf-overrides`.
 
 By default, parallel-layout candidates change only TP and DP. The generated
 benchmark config removes explicit `max-num-seqs` and
@@ -242,6 +247,65 @@ sweep/parallel-layout-recommendation.json
 ```
 
 The selected TP/DP layout becomes the fixed server layout for Stage 2.
+
+#### RTX 3090 / SM86 GPU candidates
+
+GPU sweeps use **visible GPUs**, not host NUMA nodes or aggregate VRAM. A single
+visible GPU is supported. TP is restricted to `1`, `2`, `4`, or `8`; DP spans all
+positive integers for which `TP * DP <= visible GPU count`. Before model checks:
+
+| Visible GPUs | Generated layouts |
+| ---: | --- |
+| 1 | `TP=1, DP=1` |
+| 4 | `TP=1, DP=1/2/3/4`; `TP=2, DP=1/2`; `TP=4, DP=1` |
+
+Names include `_gpu<used>of<visible>`. `hardware_info.json` records the detected
+devices and links separately; these facts never become `vllm serve` arguments.
+The environment fixes visible GPU UUID order so detection and execution agree.
+Unknown/CNS P2P status and lack of NVLink do not exclude TP, and topology does not
+establish which layout is fastest. Compare measured throughput under the same
+workload/SLA; there is no presumption that larger TP is better.
+
+The GPU layout scan supports only a single node, `PP=PCP=DCP=1`, and local internal
+DP. It rejects non-default PP/PCP/DCP, multiple nodes, nonzero node rank,
+Ray/external launchers, explicit DP rank (including zero), DP start-rank,
+explicit `data-parallel-size-local`, hybrid/external/multi-port load balancing,
+and headless mode. These settings are not silently overwritten, and context
+parallelism is not an added sweep dimension.
+
+Known attention/KV-head dimensions filter each TP candidate using partition
+**or replication** rules: TP may exceed KV heads when replication is supported.
+GPU MoE is not restricted by CPU communicator capabilities. Non-EP MoE still
+requires the effective FFN-width divisibility check above. EPLB requires EP
+and more than one participating GPU: its single-GPU candidate is explicitly
+skipped, and a package with no remaining candidate fails with saved reasons.
+These prechecks neither certify memory fit nor replace a real model launch.
+
+The RTX 3090 runtime policy keeps the recipe's TP/DP and only reduces the memory
+utilization budget, using the least-free visible GPU with per-device headroom.
+It does not pool VRAM or use CPU NUMA RAM as GPU memory. All three tuning stages
+continue to use the existing sweep runner, failure isolation and recommender.
+
+#### Server addresses in every stage
+
+Generated runners read the **actual stage YAML at execution time**, including
+the selected layout config used by concurrency/scheduler tuning. They explicitly
+pass its host/port to `vllm serve` and a matching `--base-url` to the benchmark.
+Health and benchmark clients use loopback for `0.0.0.0` or `::` binds, with IPv6
+URL brackets. A recipe using port `8100` must not probe an unrelated port `8000`
+service. Stop any existing service on the selected port before running a sweep.
+
+Native `vllm bench sweep serve` also resolves readiness and cache-reset addresses
+from `vllm serve --config <file.yaml>`. It uses the serving CLI's YAML loader and
+keeps `CLI > YAML > defaults` precedence, including explicit options placed
+before `--config`, `--host=value`, and `--port=value`. Other server backends'
+configuration files are not interpreted as vLLM YAML. The benchmark client still
+needs its matching `--base-url`.
+
+Individual stage runners forward additional CLI options, including `--dry-run`
+and `--num-runs`. To preview commands without starting a model server, use an
+individual runner such as `./run_concurrency_sweep.sh --dry-run --num-runs 1`,
+not the full recommendation pipeline, which requires measured results.
 
 ### Temporary TP/DP NUMA-binding workaround
 

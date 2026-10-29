@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from math import ceil
+from math import ceil, floor, prod
 from typing import Any
 
 from hardware_detection import HardwareInfo
@@ -335,6 +335,68 @@ def _resolve_data_parallel_size(
     )
 
 
+def _resolve_cuda_resources(
+    config: dict[str, Any],
+    hardware: HardwareInfo | None,
+    workload: WorkloadHints,
+    result: TuningResult,
+) -> None:
+    del workload
+    if hardware is None:
+        result.notes.append(
+            "CUDA resources were not detected; kept recipe memory and TP/DP values."
+        )
+        return
+    if hardware.device_type != "cuda" or not hardware.gpu_devices:
+        raise ValueError("CUDA runtime tuning requires detected visible GPUs.")
+    if any(gpu.compute_capability != (8, 6) for gpu in hardware.gpu_devices):
+        raise ValueError("RTX 3090 runtime tuning requires SM86 GPUs.")
+
+    used_gpus = prod(
+        int(config.get(key, 1))
+        for key in (
+            "tensor-parallel-size",
+            "data-parallel-size",
+            "pipeline-parallel-size",
+            "prefill-context-parallel-size",
+        )
+    )
+    if used_gpus > hardware.gpu_count:
+        raise ValueError(
+            f"Recipe requires {used_gpus} GPUs, but only "
+            f"{hardware.gpu_count} GPUs are visible."
+        )
+
+    # Memory is per rank, never the sum of VRAM across the node. Leave 2% of
+    # device capacity beyond other processes' allocations, and never increase
+    # the recipe's budget. Model/KV-cache feasibility still requires a launch.
+    safe_fraction = min(
+        0.90,
+        *(
+            gpu.free_memory_bytes / gpu.total_memory_bytes - 0.02
+            for gpu in hardware.gpu_devices
+        ),
+    )
+    candidate = (
+        floor(
+            100 * min(float(config.get("gpu-memory-utilization", 0.90)), safe_fraction)
+        )
+        / 100
+    )
+    if candidate <= 0:
+        raise ValueError("Visible GPUs have insufficient free memory for tuning.")
+    _record_override(
+        result,
+        "gpu-memory-utilization",
+        candidate,
+        "limited by the least-free visible GPU with 2% device-memory headroom",
+    )
+    result.notes.append(
+        "Kept recipe TP/DP: visible GPU count and NVML topology do not establish "
+        "the fastest layout. Use the parallel-layout sweep for measured selection."
+    )
+
+
 DEFAULT_POLICIES: tuple[Policy, ...] = (
     _resolve_tensor_parallel_size,
     _resolve_gpu_memory_utilization,
@@ -346,12 +408,16 @@ SCHEDULER_TUNING_POLICIES: tuple[Policy, ...] = (
     _resolve_max_num_batched_tokens,
 )
 
+CUDA_HARDWARE_PROFILES = frozenset({"rtx_3090", "rtx_3090_4x"})
+CUDA_POLICIES: tuple[Policy, ...] = (_resolve_cuda_resources,)
+
 # Select tuning behavior from the hardware requested by the Recipes rendering,
 # not from devices physically present in the host. A GPU server still exposes
 # its host CPU topology, so host inspection alone cannot determine deployment
 # intent.
 HARDWARE_TUNING_POLICIES: dict[str, tuple[Policy, ...]] = {
     "xeon6": DEFAULT_POLICIES,
+    **dict.fromkeys(CUDA_HARDWARE_PROFILES, CUDA_POLICIES),
 }
 
 

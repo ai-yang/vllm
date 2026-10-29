@@ -12,7 +12,7 @@ Runtime tuning combines up to three inputs:
 - **vLLM Recipe** — the required baseline from the Recipes JSON API or a direct
   recipe JSON file.
 - **Hardware information (optional)** — detected with `--detect-hardware`,
-  including effective CPU/NUMA topology and memory availability.
+  including effective CPU/NUMA resources or visible CUDA GPUs and their free VRAM.
 - **Workload information (optional)** — supplied through CLI hints such as input
   and output token lengths, concurrency, TTFT/TPOT objectives, and target QPS.
 
@@ -25,9 +25,9 @@ between these inputs and individual runtime parameters.
 ## Hardware Information
 
 Hardware detection is enabled only with `--detect-hardware`. It reports the
-effective resources available to the process or container, including CPU/NUMA
-topology and memory information. The current policy can use those values to
-refine `tensor-parallel-size` and `gpu-memory-utilization`.
+effective resources available to the process or container. The recipe's hardware
+selects CPU/NUMA detection for Xeon or NVML detection for supported CUDA profiles;
+host RAM is never treated as GPU memory.
 
 ```bash
 python3 tools/recipes/recipe_json_to_vllm_config.py \
@@ -38,6 +38,39 @@ python3 tools/recipes/recipe_json_to_vllm_config.py \
 
 Hardware detection is optional. Recipe hardware selects the tuning policy; host
 hardware detection provides resource information to that policy.
+
+### CUDA Hardware
+
+The `rtx_3090` and `rtx_3090_4x` policies require SM86 GPUs. Detection records
+visible and physical IDs, UUIDs, per-device total/free VRAM, compute capability,
+PCI/NUMA placement, and directional NVML P2P/NVLink information without creating
+a CUDA context:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,0 python3 tools/recipes/hardware_detection.py --device-type cuda
+```
+
+The converter honors the recipe's CUDA visibility during detection and writes
+the detected GPU UUIDs, in order, to `env.sh`. Source that file when running the
+generated configuration. This fixes the resource set even if a later shell has
+a different device mask. Restrict visibility before conversion to select a
+smaller resource budget.
+
+GPU tuning keeps the recipe's TP/DP layout. It caps `gpu-memory-utilization` at
+the smaller of the recipe value (0.9 if absent), 0.9, and the least-free visible
+GPU's `free / total - 0.02`, rounded down to two decimal places. The extra 2% is
+conservative headroom, not a performance optimum or a guarantee that weights,
+activations and KV cache fit. Run detection when the intended GPUs are available.
+
+NVML P2P status is not an NCCL bandwidth measurement. Missing NVLink or a nonzero
+P2P-read status does not exclude tensor parallelism: NCCL may use host staging.
+Use the existing [parallel-layout sweep](SWEEP_TUNING.md) to compare single-card,
+TP and DP configurations under the same workload and latency objectives.
+GPU layout sweeps currently cover one node, PP=PCP=DCP=1 and internal DP
+load balancing; unsupported deployment modes fail explicitly.
+
+Registering a tuning policy does not publish or validate a model recipe.
+Use a per-hardware rendering that explicitly supports the selected GPU.
 
 ## Workload Information
 
@@ -103,6 +136,10 @@ universal performance optima. This separation avoids baking workload guesses
 into `config.yml` before measurements exist. The Tune All workflow benchmarks
 TP/DP first, then concurrency, and finally scheduler settings before writing a
 final recommendation. See [SWEEP_TUNING.md](SWEEP_TUNING.md).
+
+The TP and memory formulas below apply to the Xeon policy. CUDA uses the
+[separate resource rules](#cuda-hardware) above; scheduler seed calculations
+are shared across both device types.
 
 ### `tensor-parallel-size`
 
@@ -281,13 +318,13 @@ Runtime tuning is selected from the resolved recipe JSON's `hardware` field,
 rather than by inspecting which physical devices happen to be present on the
 host. This matters because a GPU server also exposes its host CPU topology.
 
-The current runtime-tuning policy registry contains `xeon6`. A tuning request
-for unregistered recipe hardware, such as `b200`, fails before host hardware
-detection:
+The runtime-tuning policy registry contains `xeon6`, `rtx_3090`, and
+`rtx_3090_4x`. A tuning request for unregistered recipe hardware, such as
+`b200`, fails before host hardware detection:
 
 ```text
 ERROR: Runtime tuning is not supported for recipe hardware 'b200'.
-Currently supported: xeon6.
+Currently supported: rtx_3090, rtx_3090_4x, xeon6.
 ```
 
 Plain recipe conversion remains available for all recipe hardware. The gate only
@@ -347,7 +384,7 @@ with [SWEEP_TUNING.md](SWEEP_TUNING.md).
 
 ## Implementation
 
-- `hardware_detection.py` collects effective CPU/NUMA/memory information.
+- `hardware_detection.py` collects effective CPU/NUMA or visible CUDA resources.
 - `sweep/runtime_tuning.py` owns hardware-policy selection and independent parameter
   tuning functions.
 - `recipe_json_to_vllm_config.py` resolves the recipe, collects optional inputs,
